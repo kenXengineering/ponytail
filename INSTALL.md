@@ -71,6 +71,14 @@ omp runs ponytail's Pi extension unchanged, so the ruleset is injected every tur
 
 omp (and Tern, which runs omp) also loads [`pi-extension/band.ts`](pi-extension/band.ts): after every prompt it writes the task's row (cost, turns, agent time, tokens, reuse, tests, level, model) to `~/.config/ponytail/band/<project>.csv` and rebuilds `board.html` there, the same ledger and board the Claude Code band writes. The band itself does not show in omp yet.
 
+- `/ponytail-board` builds the board fresh and opens it in your browser.
+- `/ponytail-board off` stops writing rows, `/ponytail-board on` starts again. It sets `band.ledger` in `~/.config/ponytail/config.json`.
+- To send each row as JSON to a team board, n8n or a sheet script, set `band.webhookUrl` in the same file (https, or http to `localhost` only). `band.sendNames: false` leaves the task name out. A token, if the endpoint wants one, goes in the `PONYTAIL_WEBHOOK_TOKEN` environment variable and is sent as a Bearer token; it is never read from a file.
+
+```json
+{ "band": { "ledger": true, "webhookUrl": "https://example.com/ponytail", "sendNames": true } }
+```
+
 ## OpenCode
 
 ```bash

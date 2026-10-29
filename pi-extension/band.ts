@@ -3,7 +3,7 @@
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 import { boardHtml, tasksFrom } from '../hooks/band/board'
 import type { Band, Tests } from '../hooks/band/types'
@@ -20,15 +20,20 @@ import {
   parseDefs,
   resume,
   snapshot,
+  type Snapshot,
   taskKey,
   testCounts,
   upsertCsv,
+  webhookRequest,
 } from '../hooks/band/metrics'
+import ponytailConfig from '../hooks/ponytail-config.js'
 import { readDefaultMode, resolveSessionMode } from './index.js'
 
 type Entry = { type: string; message?: { role?: string; model?: string; content?: unknown } }
 type Ctx = {
   cwd: string
+  mode?: string
+  ui?: { notify?(message: string, type?: string): void; setStatus?(key: string, text: string | undefined): void }
   sessionManager: {
     getSessionId(): string
     getSessionFile(): string | undefined
@@ -44,6 +49,7 @@ type Pi = {
   on(event: string, handler: (event: Event, ctx: Ctx) => unknown): void
   exec(command: string, args: string[], options?: { cwd?: string }): Promise<{ stdout: string; code: number }>
   getSessionName(): string | undefined
+  registerCommand(name: string, options: { description: string; getArgumentCompletions?(prefix: string): { value: string; label: string }[] | null; handler(args: string, ctx: Ctx): unknown }): void
 }
 
 // What only the extension sees: one per task, shared with the task's subagents.
@@ -77,6 +83,62 @@ const readText = (file: string) => {
   } catch {
     return ''
   }
+}
+
+// Builds board.html from every project's ledger.
+function writeBoard(dir: string) {
+  mkdirSync(dir, { recursive: true })
+  const csvs = readdirSync(dir).filter(f => f.endsWith('.csv')).map(f => readText(join(dir, f)))
+  const file = join(dir, 'board.html')
+  writeFileSync(file, boardHtml(csvs.flatMap(tasksFrom), Date.now()))
+  return file
+}
+
+const readConfig = (): Record<string, unknown> => {
+  try {
+    const config = JSON.parse(readText(ponytailConfig.getConfigPath()).replace(/^\uFEFF/, ''))
+    return config && typeof config === 'object' && !Array.isArray(config) ? config : {}
+  } catch {
+    return {}
+  }
+}
+
+export type BandConfig = { ledger: boolean; webhookUrl: string; sendNames: boolean; webhookToken: string }
+
+// The band's settings, the "band" object in ponytail's config.json, the same switches as the Claude Code plugin's.
+// The webhook token comes only from PONYTAIL_WEBHOOK_TOKEN, never from a file that could land in a repo or a backup.
+export function bandConfig(): BandConfig {
+  const raw = readConfig().band
+  const band: Record<string, unknown> = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    ledger: band.ledger !== false,
+    webhookUrl: typeof band.webhookUrl === 'string' ? band.webhookUrl.trim() : '',
+    sendNames: band.sendNames !== false,
+    webhookToken: (process.env.PONYTAIL_WEBHOOK_TOKEN ?? '').trim(),
+  }
+}
+
+// Keeps every other key of config.json, as writeDefaultMode does.
+export function writeLedger(on: boolean) {
+  const config = readConfig()
+  const band = config.band && typeof config.band === 'object' ? config.band : {}
+  config.band = { ...band, ledger: on }
+  const file = ponytailConfig.getConfigPath()
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify(config, null, 2), 'utf8')
+}
+
+// The same row the ledger gets, to the webhook if one is set. Not awaited in the TUI: a slow endpoint must never hold
+// up the turn. `omp -p` exits right after the run, so there it is awaited, at most 5 seconds.
+async function send(row: Snapshot, ctx: Ctx, config: BandConfig) {
+  if (config.webhookUrl === '') return
+  const status = (text: string | undefined) => ctx.ui?.setStatus?.('ponytail-band', text)
+  const request = webhookRequest(config.webhookUrl, config.webhookToken, config.sendNames, row)
+  if ('refused' in request) return status(`ponytail band: ${request.refused}`)
+  const sent = fetch(request.url, { ...request.init, signal: AbortSignal.timeout(5000) })
+    .then(r => status(r.ok ? undefined : `ponytail band: webhook answered ${r.status}`))
+    .catch(() => status('ponytail band: webhook unreachable'))
+  if (ctx.mode === 'print' || ctx.mode === 'json') await sent
 }
 
 // Files an edit or write call touches: `path` (write, replace-mode edit) or hashline `[PATH#TAG]` headers.
@@ -188,7 +250,9 @@ export default function ponytailBand(pi: Pi) {
     startedRun = Date.now()
   })
 
-  pi.on('agent_end', async (_event, ctx) => {
+  // session_stop, not agent_end: omp awaits it before the run settles, while `omp -p` can exit with an agent_end handler still running.
+  // shortcut: a run stopped with Esc may skip session_stop, so its row catches up at the next prompt; also record on agent_end if that matters.
+  pi.on('session_stop', async (_event, ctx) => {
     const sm = ctx.sessionManager
     // A subagent's cost and tokens reach the parent through its task result; only the main session writes the row.
     if (sm.getHeader()?.parentSession || typeof sm.getUsageStatistics !== 'function') return
@@ -238,16 +302,43 @@ export default function ponytailBand(pi: Pi) {
       tests: t.tests,
       details: false,
     }
-    try {
-      const dir = ledgerDir()
-      mkdirSync(dir, { recursive: true })
-      const file = ledgerFile(dir, t.project)
-      writeFileSync(file, upsertCsv(readText(file), snapshot(band, Date.parse(header.timestamp))))
-      // The board is a plain file a refresh rereads, so it is rebuilt with every row.
-      const csvs = readdirSync(dir).filter(f => f.endsWith('.csv')).map(f => readText(join(dir, f)))
-      writeFileSync(join(dir, 'board.html'), boardHtml(csvs.flatMap(tasksFrom), Date.now()))
-    } catch {
-      // A ledger that cannot be written must never break the turn.
+    const row = snapshot(band, Date.parse(header.timestamp))
+    const config = bandConfig()
+    if (config.ledger) {
+      try {
+        const dir = ledgerDir()
+        mkdirSync(dir, { recursive: true })
+        const file = ledgerFile(dir, t.project)
+        writeFileSync(file, upsertCsv(readText(file), row))
+        // The board is a plain file a refresh rereads, so it is rebuilt with every row.
+        writeBoard(dir)
+      } catch {
+        ctx.ui?.setStatus?.('ponytail-band', 'ponytail band: could not write the task ledger')
+      }
     }
+    await send(row, ctx, config)
+  })
+
+  // No argument: build the board fresh and open it. on/off: switch the ledger (the webhook stays as set).
+  pi.registerCommand('ponytail-board', {
+    description: 'Open the task board. on|off: switch the task ledger',
+    getArgumentCompletions: prefix => ['on', 'off'].filter(v => v.startsWith(prefix.trim())).map(value => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase()
+      if (arg === 'on' || arg === 'off') {
+        writeLedger(arg === 'on')
+        ctx.ui?.notify?.(arg === 'on' ? 'Task ledger on: every prompt writes its row.' : 'Task ledger off: no rows are written.', 'info')
+        return
+      }
+      try {
+        const file = writeBoard(ledgerDir())
+        // An empty title for `start`, which otherwise takes a quoted path as the window title.
+        const opened =
+          process.platform === 'win32' ? await pi.exec('cmd', ['/c', 'start', '', file]) : await pi.exec(process.platform === 'darwin' ? 'open' : 'xdg-open', [file])
+        if (opened.code !== 0) ctx.ui?.notify?.(`Board written to ${file}; could not open a browser.`, 'warning')
+      } catch {
+        ctx.ui?.notify?.('ponytail band: could not open the board', 'error')
+      }
+    },
   })
 }
