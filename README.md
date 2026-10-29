@@ -127,7 +127,7 @@ In Claude Code, ponytail now shows a band above the prompt: what the current tas
   <img src="assets/band/board.png" width="880" alt="The ponytail board, a local page: 61 sessions, 20h 13m agent time, $285.30 and 492.5M tokens in the last 30 days; agent time per project over time; the latest sessions with their tests; active days and streak.">
 </p>
 
-**Board** opens a local page with every task across your projects: cost, agent time and tokens over time, every session with its tests, and the days you worked. By default, everything stays on your machine, in `~/.config/ponytail/band/`. `/ponytail band import` adds your past Claude Code sessions to it, with their cost, agent time and tokens.
+**Board** opens a local page with every task across your projects: cost, agent time and tokens over time, every session with its tests, and the days you worked. By default, everything stays on your machine, in `~/.config/ponytail/band/`. `/ponytail band import` adds your past Claude Code sessions to it, with their cost, agent time and tokens. Oh My Pi (and Tern) write their tasks to the same ledger and board, without the band ([INSTALL.md](INSTALL.md#oh-my-pi-omp)).
 
 ## How it works
 

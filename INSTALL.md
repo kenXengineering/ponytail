@@ -69,6 +69,8 @@ omp plugin install ponytail@ponytail
 
 omp runs ponytail's Pi extension unchanged, so the ruleset is injected every turn as in Pi (verified with omp 18.6.1). Start a new session after installing.
 
+omp (and Tern, which runs omp) also loads [`pi-extension/band.ts`](pi-extension/band.ts): after every prompt it writes the task's row (cost, turns, agent time, tokens, reuse, tests, level, model) to `~/.config/ponytail/band/<project>.csv` and rebuilds `board.html` there, the same ledger and board the Claude Code band writes. The band itself does not show in omp yet.
+
 ## OpenCode
 
 ```bash
